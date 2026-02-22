@@ -1,6 +1,7 @@
 import { useState, useCallback } from 'react';
 import { Transaction, TransactionCategory, TransactionType } from '@/types/transaction';
 import { classifyTransaction, parseAmount, parseDate } from '@/utils/classifyTransaction';
+import { extractTextFromPdf, parsePdfTransactionLines } from '@/utils/pdfParser';
 import { useToast } from '@/hooks/use-toast';
 
 // Sample data for demo
@@ -169,10 +170,38 @@ export function useTransactions() {
           description: 'Por favor exporta tu archivo a CSV para procesarlo',
         });
       } else if (file.name.endsWith('.pdf')) {
-        // PDF parsing would require a backend service
+        const text = await extractTextFromPdf(file);
+        const parsed = parsePdfTransactionLines(text);
+        
+        if (parsed.length === 0) {
+          toast({
+            title: 'PDF procesado',
+            description: 'No se encontraron transacciones reconocibles. Intenta con CSV.',
+            variant: 'destructive',
+          });
+          return;
+        }
+
+        const newTransactions: Transaction[] = parsed.map((row, i) => {
+          const amount = parseAmount(row.amount);
+          const type: TransactionType = amount >= 0 ? 'ingreso' : 'egreso';
+          const { category, isOwnTransfer } = classifyTransaction(row.description, amount, userBanks);
+          return {
+            id: `pdf-${Date.now()}-${i}`,
+            date: parseDate(row.date),
+            description: row.description,
+            amount,
+            type,
+            category,
+            bank: 'PDF Import',
+            isOwnTransfer,
+          };
+        });
+
+        setTransactions(prev => [...prev, ...newTransactions]);
         toast({
-          title: 'Formato PDF detectado',
-          description: 'El procesamiento de PDF requiere configuración adicional',
+          title: 'PDF procesado',
+          description: `Se importaron ${newTransactions.length} transacciones`,
         });
       }
     } catch (error) {
@@ -194,10 +223,19 @@ export function useTransactions() {
     );
   }, []);
 
+  const deleteTransaction = useCallback((id: string) => {
+    setTransactions(prev => prev.filter(t => t.id !== id));
+    toast({
+      title: 'Transacción eliminada',
+      description: 'La transacción ha sido removida',
+    });
+  }, [toast]);
+
   return {
     transactions,
     processFile,
     updateCategory,
+    deleteTransaction,
     userBanks,
   };
 }

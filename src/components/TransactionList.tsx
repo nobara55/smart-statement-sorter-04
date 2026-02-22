@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ArrowUpCircle, ArrowDownCircle, MoreHorizontal, ListFilter } from 'lucide-react';
+import { ArrowUpCircle, ArrowDownCircle, Trash2, ListFilter } from 'lucide-react';
 import { Transaction, CATEGORIES, TransactionCategory } from '@/types/transaction';
 import { cn } from '@/lib/utils';
 import {
@@ -13,9 +13,10 @@ import {
 interface TransactionListProps {
   transactions: Transaction[];
   onUpdateCategory: (id: string, category: TransactionCategory) => void;
+  onDelete: (id: string) => void;
 }
 
-export function TransactionList({ transactions, onUpdateCategory }: TransactionListProps) {
+export function TransactionList({ transactions, onUpdateCategory, onDelete }: TransactionListProps) {
   const [filter, setFilter] = useState<string>('todas');
   
   const filteredTransactions = transactions.filter(t => {
@@ -122,8 +123,12 @@ export function TransactionList({ transactions, onUpdateCategory }: TransactionL
                 {formatAmount(transaction.amount, transaction.type)}
               </span>
 
-              <button className="p-1 rounded hover:bg-secondary transition-colors">
-                <MoreHorizontal className="w-4 h-4 text-muted-foreground" />
+              <button 
+                onClick={() => onDelete(transaction.id)}
+                className="p-1 rounded hover:bg-destructive/20 transition-colors"
+                title="Eliminar transacción"
+              >
+                <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive" />
               </button>
             </div>
           ))
