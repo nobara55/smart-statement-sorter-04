@@ -6,7 +6,7 @@ import { IncomeStatement } from '@/components/IncomeStatement';
 import { useTransactions } from '@/hooks/useTransactions';
 
 const Index = () => {
-  const { transactions, processFile, updateCategory } = useTransactions();
+  const { transactions, processFile, updateCategory, deleteTransaction } = useTransactions();
 
   return (
     <div className="min-h-screen bg-background">
@@ -25,7 +25,8 @@ const Index = () => {
             <FileUpload onFileUpload={processFile} />
             <TransactionList 
               transactions={transactions} 
-              onUpdateCategory={updateCategory} 
+              onUpdateCategory={updateCategory}
+              onDelete={deleteTransaction}
             />
           </div>
 
