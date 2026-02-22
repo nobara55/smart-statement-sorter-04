@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react';
 import { Transaction, TransactionCategory, TransactionType } from '@/types/transaction';
 import { classifyTransaction, parseAmount, parseDate } from '@/utils/classifyTransaction';
-import { extractTextFromPdf, parsePdfTransactionLines } from '@/utils/pdfParser';
+import { parsePdfFile } from '@/utils/pdfParser';
 import { useToast } from '@/hooks/use-toast';
 
 // Sample data for demo
@@ -170,8 +170,7 @@ export function useTransactions() {
           description: 'Por favor exporta tu archivo a CSV para procesarlo',
         });
       } else if (file.name.endsWith('.pdf')) {
-        const text = await extractTextFromPdf(file);
-        const parsed = parsePdfTransactionLines(text);
+        const parsed = await parsePdfFile(file);
         
         if (parsed.length === 0) {
           toast({
