@@ -1,7 +1,8 @@
 import * as pdfjsLib from 'pdfjs-dist';
+import workerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url';
 
-// Configure worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs`;
+// Configure worker using Vite's ?url import for reliable bundling
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
 interface TextItem {
   str: string;
@@ -125,16 +126,32 @@ function parseBBVADebit(pages: TextItem[][], fullText: string): ParsedRow[] {
   const year = yearMatch ? yearMatch[1] : new Date().getFullYear().toString();
 
   // Date pattern: DD/MMM (Spanish 3-letter month)
-  const datePattern = /^(\d{1,2})\/([A-Za-z]{3})$/;
+  const datePattern = /^(\d{1,2})\/([A-Za-zÁÉÍÓÚáéíóú]{3})$/;
   // Amount pattern
   const amountPattern = /^[\d,]+\.\d{2}$/;
 
   for (const pageItems of pages) {
     const rows = groupIntoRows(pageItems);
     
+    // Find the header row to detect CARGOS and ABONOS column X positions
+    let cargosX = -1;
+    let abonosX = -1;
+    
+    for (const row of rows) {
+      for (const item of row) {
+        const t = item.str.toUpperCase().trim();
+        if (t === 'CARGOS') cargosX = item.x;
+        if (t === 'ABONOS') abonosX = item.x;
+      }
+      if (cargosX > 0 && abonosX > 0) break;
+    }
+    
+    // If we couldn't find headers, use a large tolerance fallback
+    const hasCols = cargosX > 0 && abonosX > 0;
+    const colMidpoint = hasCols ? (cargosX + abonosX) / 2 : 0;
+    
     for (const row of rows) {
       const texts = row.map(item => item.str);
-      const rowText = texts.join(' ');
       
       // Look for date at the beginning
       let dateStr = '';
@@ -156,7 +173,10 @@ function parseBBVADebit(pages: TextItem[][], fullText: string): ParsedRow[] {
       
       if (!dateStr || foundDateIdx < 0) continue;
       
-      // Find amounts in the row
+      // Skip rows that look like dates only (two dates side by side = FECHA OPER)
+      // We need at least a description
+      
+      // Find amounts in the row with their X positions
       const amounts: { value: string; x: number; idx: number }[] = [];
       for (let i = foundDateIdx + 1; i < texts.length; i++) {
         const cleaned = texts[i].replace(/[$,]/g, '');
@@ -167,31 +187,50 @@ function parseBBVADebit(pages: TextItem[][], fullText: string): ParsedRow[] {
       
       if (amounts.length === 0) continue;
       
-      // Build description from text between date and first amount
+      // Build description: text between second date occurrence and first amount
+      // BBVA debit has: FECHA | OPER | LIQ(=date) | DESCRIPCION | ... | CARGOS | ABONOS | ...
       const descParts: string[] = [];
-      for (let i = foundDateIdx + 1; i < amounts[0].idx; i++) {
-        // Skip if it's another date
-        if (datePattern.test(texts[i])) continue;
+      let dateCount = 0;
+      for (let i = foundDateIdx; i < amounts[0].idx; i++) {
+        if (datePattern.test(texts[i])) {
+          dateCount++;
+          continue;
+        }
+        // Skip reference-like strings (long numbers, "Referencia", etc.)
+        if (/^\d{10,}$/.test(texts[i])) continue;
         descParts.push(texts[i]);
       }
       const description = descParts.join(' ').trim();
       
       if (description.length < 2) continue;
       
-      // Determine cargo vs abono based on description keywords
-      const descLower = description.toLowerCase();
-      const isAbono = descLower.includes('recibido') || 
-                      descLower.includes('abono') || 
-                      descLower.includes('pago cuenta de tercero') ||
-                      descLower.includes('devuelto');
+      // Determine cargo vs abono using column X positions
+      let isCargo = true;
+      
+      if (hasCols) {
+        // Use the first amount's X position relative to column headers
+        const firstAmountX = amounts[0].x;
+        // If the amount is closer to ABONOS column, it's an abono
+        const distToCargos = Math.abs(firstAmountX - cargosX);
+        const distToAbonos = Math.abs(firstAmountX - abonosX);
+        isCargo = distToCargos <= distToAbonos;
+      } else {
+        // Fallback to keyword matching
+        const descLower = description.toLowerCase();
+        const isAbono = descLower.includes('recibido') || 
+                        descLower.includes('abono') || 
+                        descLower.includes('pago cuenta de tercero') ||
+                        descLower.includes('devuelto');
+        isCargo = !isAbono;
+      }
       
       const amount = cleanAmount(amounts[0].value);
       
       results.push({
         date: dateStr,
         description,
-        amount: isAbono ? amount : `-${amount}`,
-        type: isAbono ? 'abono' : 'cargo',
+        amount: isCargo ? `-${amount}` : amount,
+        type: isCargo ? 'cargo' : 'abono',
       });
     }
   }
