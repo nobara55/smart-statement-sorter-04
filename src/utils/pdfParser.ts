@@ -92,18 +92,24 @@ type BankFormat = 'bbva_debit' | 'bbva_credit' | 'banregio' | 'unknown';
 
 function detectFormat(fullText: string): BankFormat {
   const t = fullText.toLowerCase();
-  if (t.includes('hey banco') || t.includes('banregio') || t.includes('cuenta hey smart')) {
-    return 'banregio';
-  }
-  if (t.includes('bbva') && (t.includes('tarjeta') || t.includes('tdc') || t.includes('crédito') || t.includes('credito') || t.includes('tarjeta oro'))) {
-    return 'bbva_credit';
-  }
-  if (t.includes('bbva') && (t.includes('libretón') || t.includes('libreton') || t.includes('cuenta digital'))) {
+  
+  // Check BBVA first — transaction descriptions may mention other banks (e.g. "SPEI ENVIADO BANREGIO")
+  if (t.includes('bbva')) {
+    if (t.includes('tarjeta') || t.includes('tdc') || t.includes('crédito') || t.includes('credito') || t.includes('tarjeta oro')) {
+      return 'bbva_credit';
+    }
     return 'bbva_debit';
   }
-  if (t.includes('bbva')) {
-    return 'bbva_debit'; // default BBVA
+  
+  // Banregio / Hey Banco — only if BBVA is NOT present
+  if (t.includes('hey banco') || t.includes('cuenta hey smart')) {
+    return 'banregio';
   }
+  // Check for banregio as issuer (not just mentioned in a transaction)
+  if (t.includes('banregio') && !t.includes('bbva')) {
+    return 'banregio';
+  }
+  
   return 'unknown';
 }
 
