@@ -491,6 +491,7 @@ export async function parsePdfFile(file: File): Promise<Array<{
   const format = detectFormat(fullText);
   
   console.log(`[PDF Parser] Detected format: ${format}`);
+  console.log(`[PDF Parser] Total pages: ${pages.length}`);
   
   let parsed: ParsedRow[] = [];
   
