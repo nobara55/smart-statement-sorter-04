@@ -8,20 +8,22 @@ export function classifyTransaction(
   const descLower = description.toLowerCase();
   const type: TransactionType = amount >= 0 ? 'ingreso' : 'egreso';
   
-  // Check for own bank transfers
+  // Mark as own transfer only when the description explicitly indicates it's between the user's own accounts
   const isTransfer = descLower.includes('spei') || 
                      descLower.includes('transferencia') || 
                      descLower.includes('traspaso');
+
+  const ownTransferHints = [
+    'transferencia propia',
+    'cuenta propia',
+    'mismo titular',
+    'entre cuentas',
+    'mi cuenta',
+    'traspaso entre cuentas',
+  ];
   
-  if (isTransfer) {
-    // Check if transfer mentions any of user's banks
-    const mentionedBank = [...BANKS, ...existingBanks].find(bank => 
-      descLower.includes(bank.toLowerCase())
-    );
-    
-    if (mentionedBank && existingBanks.some(b => b.toLowerCase() === mentionedBank.toLowerCase())) {
-      return { category: 'transferencia_propia', isOwnTransfer: true };
-    }
+  if (isTransfer && ownTransferHints.some(hint => descLower.includes(hint))) {
+    return { category: 'transferencia_propia', isOwnTransfer: true };
   }
   
   // Try to match category by keywords
