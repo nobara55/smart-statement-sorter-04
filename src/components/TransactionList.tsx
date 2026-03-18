@@ -29,6 +29,7 @@ export function TransactionList({ transactions, onUpdateCategory, onDelete }: Tr
   });
 
   const formatDate = (date: Date) => {
+    if (!date || isNaN(date.getTime())) return 'Sin fecha';
     return new Intl.DateTimeFormat('es-MX', { 
       day: 'numeric', 
       month: 'short' 
