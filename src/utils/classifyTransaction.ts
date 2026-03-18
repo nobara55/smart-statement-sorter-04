@@ -56,23 +56,36 @@ export function parseAmount(value: string): number {
 }
 
 export function parseDate(value: string): Date {
-  // Try common date formats
-  const formats = [
-    /(\d{1,2})\/(\d{1,2})\/(\d{4})/,  // DD/MM/YYYY or MM/DD/YYYY
-    /(\d{4})-(\d{2})-(\d{2})/,         // YYYY-MM-DD
-    /(\d{1,2})-(\d{1,2})-(\d{4})/,     // DD-MM-YYYY
-  ];
-  
-  for (const format of formats) {
-    const match = value.match(format);
-    if (match) {
-      // Assume DD/MM/YYYY format (common in Spanish)
-      if (format === formats[0]) {
-        return new Date(parseInt(match[3]), parseInt(match[2]) - 1, parseInt(match[1]));
-      }
-      return new Date(value);
-    }
+  // Try DD/MM/YYYY
+  const ddmmyyyy = value.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (ddmmyyyy) {
+    return new Date(parseInt(ddmmyyyy[3]), parseInt(ddmmyyyy[2]) - 1, parseInt(ddmmyyyy[1]));
   }
-  
-  return new Date(value);
+
+  // Try YYYY-MM-DD
+  const iso = value.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    return new Date(parseInt(iso[1]), parseInt(iso[2]) - 1, parseInt(iso[3]));
+  }
+
+  // Try DD-MM-YYYY
+  const ddmmyyyy2 = value.match(/(\d{1,2})-(\d{1,2})-(\d{4})/);
+  if (ddmmyyyy2) {
+    return new Date(parseInt(ddmmyyyy2[3]), parseInt(ddmmyyyy2[2]) - 1, parseInt(ddmmyyyy2[1]));
+  }
+
+  // Try DD/MM/YY
+  const ddmmyy = value.match(/(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (ddmmyy) {
+    const yr = parseInt(ddmmyy[3]) + 2000;
+    return new Date(yr, parseInt(ddmmyy[2]) - 1, parseInt(ddmmyy[1]));
+  }
+
+  // Fallback: return current date to avoid Invalid Date crashes
+  const fallback = new Date(value);
+  if (isNaN(fallback.getTime())) {
+    console.warn(`[parseDate] Could not parse date: "${value}", using current date`);
+    return new Date();
+  }
+  return fallback;
 }
