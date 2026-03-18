@@ -1,7 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url';
 
-// Configure worker using Vite's ?url import for reliable bundling
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
 interface TextItem {
@@ -18,16 +17,30 @@ interface ParsedRow {
   type: 'cargo' | 'abono';
 }
 
-// Spanish month abbreviations
+interface PageColumnContext {
+  cargosX: number | null;
+  abonosX: number | null;
+}
+
 const MONTH_MAP: Record<string, string> = {
-  'ene': '01', 'feb': '02', 'mar': '03', 'abr': '04',
-  'may': '05', 'jun': '06', 'jul': '07', 'ago': '08',
-  'sep': '09', 'oct': '10', 'nov': '11', 'dic': '12',
+  ene: '01',
+  feb: '02',
+  mar: '03',
+  abr: '04',
+  may: '05',
+  jun: '06',
+  jul: '07',
+  ago: '08',
+  sep: '09',
+  oct: '10',
+  nov: '11',
+  dic: '12',
 };
 
-/**
- * Extract text items with position info from a PDF
- */
+const BBVA_DEBIT_DATE_PATTERN = /^\d{1,2}\/[A-Za-zÁÉÍÓÚáéíóú]{3}$/;
+const BBVA_CREDIT_DATE_PATTERN = /(\d{1,2})-([a-záéíóú]{3})-(\d{4})/i;
+const SIMPLE_AMOUNT_PATTERN = /^\$?[\d,]+\.\d{2}$/;
+
 async function extractTextItems(file: File): Promise<{ items: TextItem[]; fullText: string; pages: TextItem[][] }> {
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -42,14 +55,15 @@ async function extractTextItems(file: File): Promise<{ items: TextItem[]; fullTe
     const viewport = page.getViewport({ scale: 1 });
     const pageItems: TextItem[] = [];
 
-    for (const item of textContent.items as any[]) {
+    for (const item of textContent.items as Array<{ str?: string; transform: number[]; width: number }>) {
       if (item.str && item.str.trim()) {
         const x = item.transform[4];
-        const y = viewport.height - item.transform[5]; // flip Y
+        const y = viewport.height - item.transform[5];
         pageItems.push({ str: item.str.trim(), x, y, width: item.width });
-        fullText += item.str + ' ';
+        fullText += `${item.str} `;
       }
     }
+
     fullText += '\n';
     allItems.push(...pageItems);
     pages.push(pageItems);
@@ -58,252 +72,311 @@ async function extractTextItems(file: File): Promise<{ items: TextItem[]; fullTe
   return { items: allItems, fullText, pages };
 }
 
-/**
- * Group text items into rows based on Y position
- */
-function groupIntoRows(items: TextItem[], tolerance = 5): TextItem[][] {
+function groupIntoRows(items: TextItem[], tolerance = 7): TextItem[][] {
   if (items.length === 0) return [];
 
   const sorted = [...items].sort((a, b) => a.y - b.y || a.x - b.x);
-  const rows: TextItem[][] = [];
-  let currentRow: TextItem[] = [sorted[0]];
-  let currentY = sorted[0].y;
+  const grouped: Array<{ y: number; items: TextItem[] }> = [];
 
-  for (let i = 1; i < sorted.length; i++) {
-    if (Math.abs(sorted[i].y - currentY) <= tolerance) {
-      currentRow.push(sorted[i]);
+  for (const item of sorted) {
+    const lastGroup = grouped[grouped.length - 1];
+
+    if (lastGroup && Math.abs(item.y - lastGroup.y) <= tolerance) {
+      lastGroup.items.push(item);
+      lastGroup.y = (lastGroup.y * (lastGroup.items.length - 1) + item.y) / lastGroup.items.length;
     } else {
-      currentRow.sort((a, b) => a.x - b.x);
-      rows.push(currentRow);
-      currentRow = [sorted[i]];
-      currentY = sorted[i].y;
+      grouped.push({ y: item.y, items: [item] });
     }
   }
-  currentRow.sort((a, b) => a.x - b.x);
-  rows.push(currentRow);
 
-  return rows;
+  const merged: Array<{ y: number; items: TextItem[] }> = [];
+  for (const group of grouped) {
+    const previous = merged[merged.length - 1];
+    if (previous && Math.abs(group.y - previous.y) <= tolerance) {
+      previous.items.push(...group.items);
+      previous.y = (previous.y + group.y) / 2;
+    } else {
+      merged.push({ ...group, items: [...group.items] });
+    }
+  }
+
+  return merged.map(group => group.items.sort((a, b) => a.x - b.x));
 }
 
-/**
- * Detect bank format from full text
- */
 type BankFormat = 'bbva_debit' | 'bbva_credit' | 'banregio' | 'unknown';
 
 function detectFormat(fullText: string): BankFormat {
-  const t = fullText.toLowerCase();
-  
-  // Check BBVA first — transaction descriptions may mention other banks (e.g. "SPEI ENVIADO BANREGIO")
+  const t = normalizeText(fullText);
+
   if (t.includes('bbva')) {
-    if (t.includes('tarjeta') || t.includes('tdc') || t.includes('crédito') || t.includes('credito') || t.includes('tarjeta oro')) {
-      return 'bbva_credit';
-    }
+    const creditMarkers = [
+      'tarjeta de credito',
+      'fecha limite de pago',
+      'pago minimo',
+      'pago para no generar intereses',
+      'linea de credito',
+      'numero de tarjeta',
+      'pago total para no generar intereses',
+    ];
+
+    const debitMarkers = [
+      'libreton',
+      'cuenta digital',
+      'detalle de movimientos realizados',
+      'movimientos',
+      'saldo promedio',
+      'depositos / abonos',
+    ];
+
+    if (creditMarkers.some(marker => t.includes(marker))) return 'bbva_credit';
+    if (debitMarkers.some(marker => t.includes(marker))) return 'bbva_debit';
     return 'bbva_debit';
   }
-  
-  // Banregio / Hey Banco — only if BBVA is NOT present
+
   if (t.includes('hey banco') || t.includes('cuenta hey smart')) {
     return 'banregio';
   }
-  // Check for banregio as issuer (not just mentioned in a transaction)
-  if (t.includes('banregio') && !t.includes('bbva')) {
+
+  if (t.includes('banregio')) {
     return 'banregio';
   }
-  
+
   return 'unknown';
 }
 
-/**
- * Parse amount string to clean number string
- */
+function normalizeText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function cleanAmount(val: string): string {
   return val.replace(/[$,\s+]/g, '').trim();
 }
 
-/**
- * Parse BBVA debit format
- * Dates like "22/AGO", amounts in CARGOS/ABONOS columns
- */
+function parseAmountNumber(val: string): number | null {
+  const cleaned = cleanAmount(val);
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isAmountToken(value: string): boolean {
+  return SIMPLE_AMOUNT_PATTERN.test(value);
+}
+
+function parseBbvaDebitDate(value: string, year: string): string | null {
+  const match = value.match(/^(\d{1,2})\/([A-Za-zÁÉÍÓÚáéíóú]{3})$/);
+  if (!match) return null;
+
+  const day = match[1].padStart(2, '0');
+  const month = MONTH_MAP[normalizeText(match[2]).slice(0, 3)];
+  if (!month) return null;
+
+  return `${day}/${month}/${year}`;
+}
+
+function isLikelyContinuation(texts: string[]): boolean {
+  if (texts.length === 0) return false;
+
+  const rowText = normalizeText(texts.join(' '));
+  if (!rowText || rowText.length < 4) return false;
+
+  const blockedStarts = [
+    'bbva',
+    'pagina',
+    'total de movimientos',
+    'cuadro resumen',
+    'glosario',
+    'fecha',
+    'tipo',
+    'descripcion',
+    'importe',
+    'saldo',
+    'no. de cuenta',
+    'no. de cliente',
+    'otros cargos',
+    'av. paseo',
+  ];
+
+  return !blockedStarts.some(prefix => rowText.startsWith(prefix));
+}
+
+function getPageColumnContext(rows: TextItem[][]): PageColumnContext {
+  let cargosX: number | null = null;
+  let abonosX: number | null = null;
+
+  for (const row of rows) {
+    for (const item of row) {
+      const value = normalizeText(item.str);
+      if (value === 'cargos') cargosX = item.x;
+      if (value === 'abonos') abonosX = item.x;
+    }
+
+    if (cargosX !== null && abonosX !== null) break;
+  }
+
+  return { cargosX, abonosX };
+}
+
+function inferBbvaDebitType(params: {
+  description: string;
+  amount: number;
+  amountX: number;
+  balance: number | null;
+  previousBalance: number | null;
+  context: PageColumnContext;
+}): 'cargo' | 'abono' {
+  const { description, amount, amountX, balance, previousBalance, context } = params;
+
+  if (context.cargosX !== null && context.abonosX !== null) {
+    const distToCargos = Math.abs(amountX - context.cargosX);
+    const distToAbonos = Math.abs(amountX - context.abonosX);
+    return distToCargos <= distToAbonos ? 'cargo' : 'abono';
+  }
+
+  if (balance !== null) {
+    if (previousBalance !== null) {
+      if (Math.abs(previousBalance + amount - balance) < 0.02) return 'abono';
+      if (Math.abs(previousBalance - amount - balance) < 0.02) return 'cargo';
+    } else if (Math.abs(balance - amount) < 0.02) {
+      return 'abono';
+    }
+  }
+
+  const normalized = normalizeText(description);
+
+  if (/(spei recibido|deposito|abono|interes|devuelto|devolucion|transferencia recibida)/.test(normalized)) {
+    return 'abono';
+  }
+
+  if (/(spei enviado|retiro|compra|pago tarjeta|stm financial|comision|cargo|transferencia enviada)/.test(normalized)) {
+    return 'cargo';
+  }
+
+  return 'cargo';
+}
+
 function parseBBVADebit(pages: TextItem[][], fullText: string): ParsedRow[] {
   const results: ParsedRow[] = [];
-  
-  // Extract year from period text like "DEL 15/08/2024 AL 14/09/2024"
   const yearMatch = fullText.match(/(?:AL|al)\s+\d{1,2}\/\d{1,2}\/(\d{4})/);
   const year = yearMatch ? yearMatch[1] : new Date().getFullYear().toString();
 
-  // Date pattern: DD/MMM (Spanish 3-letter month)
-  const datePattern = /^(\d{1,2})\/([A-Za-zÁÉÍÓÚáéíóú]{3})$/;
-  // Amount pattern
-  const amountPattern = /^[\d,]+\.\d{2}$/;
-
   for (const pageItems of pages) {
     const rows = groupIntoRows(pageItems);
-    
-    // Find the header row to detect CARGOS and ABONOS column X positions
-    let cargosX = -1;
-    let abonosX = -1;
-    
+    const context = getPageColumnContext(rows);
+    let previousBalance: number | null = null;
+    let lastParsedIndex: number | null = null;
+
     for (const row of rows) {
-      for (const item of row) {
-        const t = item.str.toUpperCase().trim();
-        if (t === 'CARGOS') cargosX = item.x;
-        if (t === 'ABONOS') abonosX = item.x;
-      }
-      if (cargosX > 0 && abonosX > 0) break;
-    }
-    
-    // If we couldn't find headers, use a large tolerance fallback
-    const hasCols = cargosX > 0 && abonosX > 0;
-    const colMidpoint = hasCols ? (cargosX + abonosX) / 2 : 0;
-    
-    for (const row of rows) {
-      const texts = row.map(item => item.str);
-      
-      // Look for date at the beginning
-      let dateStr = '';
-      let foundDateIdx = -1;
-      
-      for (let i = 0; i < texts.length; i++) {
-        const match = texts[i].match(datePattern);
-        if (match) {
-          const day = match[1].padStart(2, '0');
-          const monthAbbr = match[2].toLowerCase();
-          const month = MONTH_MAP[monthAbbr];
-          if (month) {
-            dateStr = `${day}/${month}/${year}`;
-            foundDateIdx = i;
-            break;
-          }
+      const texts = row.map(item => item.str.trim()).filter(Boolean);
+      if (texts.length === 0) continue;
+
+      const dateIndex = texts.findIndex(text => BBVA_DEBIT_DATE_PATTERN.test(text));
+      const amountEntries = texts
+        .map((text, idx) => ({ text, idx, x: row[idx].x, value: parseAmountNumber(text) }))
+        .filter(entry => isAmountToken(entry.text) && entry.value !== null) as Array<{
+          text: string;
+          idx: number;
+          x: number;
+          value: number;
+        }>;
+
+      if (dateIndex === -1) {
+        if (lastParsedIndex !== null && amountEntries.length === 0 && isLikelyContinuation(texts)) {
+          results[lastParsedIndex].description = `${results[lastParsedIndex].description} ${texts.join(' ')}`.trim();
         }
+        continue;
       }
-      
-      if (!dateStr || foundDateIdx < 0) continue;
-      
-      // Skip rows that look like dates only (two dates side by side = FECHA OPER)
-      // We need at least a description
-      
-      // Find amounts in the row with their X positions
-      const amounts: { value: string; x: number; idx: number }[] = [];
-      for (let i = foundDateIdx + 1; i < texts.length; i++) {
-        const cleaned = texts[i].replace(/[$,]/g, '');
-        if (amountPattern.test(texts[i]) || /^[\d]+\.\d{2}$/.test(cleaned)) {
-          amounts.push({ value: texts[i], x: row[i].x, idx: i });
-        }
-      }
-      
-      if (amounts.length === 0) continue;
-      
-      // Build description: text between second date occurrence and first amount
-      // BBVA debit has: FECHA | OPER | LIQ(=date) | DESCRIPCION | ... | CARGOS | ABONOS | ...
-      const descParts: string[] = [];
-      let dateCount = 0;
-      for (let i = foundDateIdx; i < amounts[0].idx; i++) {
-        if (datePattern.test(texts[i])) {
-          dateCount++;
-          continue;
-        }
-        // Skip reference-like strings (long numbers, "Referencia", etc.)
-        if (/^\d{10,}$/.test(texts[i])) continue;
-        descParts.push(texts[i]);
-      }
-      const description = descParts.join(' ').trim();
-      
+
+      const parsedDate = parseBbvaDebitDate(texts[dateIndex], year);
+      if (!parsedDate || amountEntries.length === 0) continue;
+
+      const firstAmount = amountEntries[0];
+      const balance = amountEntries.length > 1 ? amountEntries[amountEntries.length - 1].value : null;
+      const descriptionParts = texts
+        .slice(dateIndex + 1, firstAmount.idx)
+        .filter(text => !BBVA_DEBIT_DATE_PATTERN.test(text))
+        .filter(text => !/^\d{10,}$/.test(text));
+
+      const description = descriptionParts.join(' ').trim();
       if (description.length < 2) continue;
-      
-      // Determine cargo vs abono using column X positions
-      let isCargo = true;
-      
-      if (hasCols) {
-        // Use the first amount's X position relative to column headers
-        const firstAmountX = amounts[0].x;
-        // If the amount is closer to ABONOS column, it's an abono
-        const distToCargos = Math.abs(firstAmountX - cargosX);
-        const distToAbonos = Math.abs(firstAmountX - abonosX);
-        isCargo = distToCargos <= distToAbonos;
-      } else {
-        // Fallback to keyword matching
-        const descLower = description.toLowerCase();
-        const isAbono = descLower.includes('recibido') || 
-                        descLower.includes('abono') || 
-                        descLower.includes('pago cuenta de tercero') ||
-                        descLower.includes('devuelto');
-        isCargo = !isAbono;
-      }
-      
-      const amount = cleanAmount(amounts[0].value);
-      
-      results.push({
-        date: dateStr,
+
+      const movementType = inferBbvaDebitType({
         description,
-        amount: isCargo ? `-${amount}` : amount,
-        type: isCargo ? 'cargo' : 'abono',
+        amount: firstAmount.value,
+        amountX: firstAmount.x,
+        balance,
+        previousBalance,
+        context,
       });
+
+      const amount = cleanAmount(firstAmount.text);
+      results.push({
+        date: parsedDate,
+        description,
+        amount: movementType === 'cargo' ? `-${amount}` : amount,
+        type: movementType,
+      });
+
+      lastParsedIndex = results.length - 1;
+      if (balance !== null) previousBalance = balance;
     }
   }
 
   return results;
 }
 
-/**
- * Parse BBVA credit card format
- * Dates like "07-may-2025", amounts with +/- $
- */
-function parseBBVACredit(pages: TextItem[][], fullText: string): ParsedRow[] {
+function parseBBVACredit(pages: TextItem[][]): ParsedRow[] {
   const results: ParsedRow[] = [];
-  
-  // Match lines with date pattern DD-mmm-YYYY
-  const datePattern = /(\d{1,2})-([a-záéíóú]{3})-(\d{4})/i;
   const amountPattern = /([+-])\s*\$\s*([\d,]+\.\d{2})/;
 
   for (const pageItems of pages) {
     const rows = groupIntoRows(pageItems);
-    
+
     for (const row of rows) {
       const rowText = row.map(item => item.str).join(' ');
-      
-      const dateMatch = rowText.match(datePattern);
+      const dateMatch = rowText.match(BBVA_CREDIT_DATE_PATTERN);
       if (!dateMatch) continue;
-      
-      const day = dateMatch[1].padStart(2, '0');
-      const monthAbbr = dateMatch[2].toLowerCase();
-      const month = MONTH_MAP[monthAbbr];
+
+      const month = MONTH_MAP[normalizeText(dateMatch[2]).slice(0, 3)];
       if (!month) continue;
-      const dateStr = `${day}/${month}/${dateMatch[3]}`;
-      
+
+      const date = `${dateMatch[1].padStart(2, '0')}/${month}/${dateMatch[3]}`;
       const amountMatch = rowText.match(amountPattern);
       if (!amountMatch) continue;
-      
-      const sign = amountMatch[1];
-      const amountVal = amountMatch[2].replace(/,/g, '');
-      
-      // Extract description: text between the two date occurrences and before amount
-      // Format: "fecha operacion | fecha cargo | descripcion | monto"
+
       const texts = row.map(item => item.str);
-      const descParts: string[] = [];
-      let dateCount = 0;
-      let reachedDesc = false;
-      
+      const descriptionParts: string[] = [];
+      let seenDates = 0;
+
       for (const text of texts) {
-        if (datePattern.test(text)) {
-          dateCount++;
-          if (dateCount >= 2) reachedDesc = true;
+        if (BBVA_CREDIT_DATE_PATTERN.test(text)) {
+          seenDates += 1;
           continue;
         }
-        if (reachedDesc && !amountPattern.test(text) && !text.match(/^[+-]$/) && !text.match(/^\$/) && !text.match(/^[\d,]+\.\d{2}$/)) {
-          descParts.push(text);
+
+        if (
+          seenDates >= 2 &&
+          !amountPattern.test(text) &&
+          !/^[+-]$/.test(text) &&
+          text !== '$' &&
+          !SIMPLE_AMOUNT_PATTERN.test(text)
+        ) {
+          descriptionParts.push(text);
         }
       }
-      
-      const description = descParts.join(' ').trim();
+
+      const description = descriptionParts.join(' ').trim();
       if (description.length < 2) continue;
-      
-      // For credit cards: + = cargo (expense), - = payment/abono
-      const isCargo = sign === '+';
-      
+
+      const isCargo = amountMatch[1] === '+';
       results.push({
-        date: dateStr,
+        date,
         description,
-        amount: isCargo ? `-${amountVal}` : amountVal,
+        amount: isCargo ? `-${cleanAmount(amountMatch[2])}` : cleanAmount(amountMatch[2]),
         type: isCargo ? 'cargo' : 'abono',
       });
     }
@@ -312,136 +385,75 @@ function parseBBVACredit(pages: TextItem[][], fullText: string): ParsedRow[] {
   return results;
 }
 
-/**
- * Parse Banregio / Hey Banco format
- * Days only (09, 10...), period header gives month/year
- * Columns: DIA | CONCEPTO | CARGOS | ABONOS | SALDO
- */
 function parseBanregio(pages: TextItem[][], fullText: string): ParsedRow[] {
   const results: ParsedRow[] = [];
-  
-  // Extract period: "del 01 al 31 de ENERO 2025"
   const periodMatch = fullText.match(/del\s+\d+\s+al\s+\d+\s+de\s+([A-ZÁÉÍÓÚa-záéíóú]+)\s+(\d{4})/i);
   let periodMonth = '01';
   let periodYear = new Date().getFullYear().toString();
-  
+
   if (periodMatch) {
-    const monthName = periodMatch[1].toLowerCase();
+    const monthName = normalizeText(periodMatch[1]);
     const monthNames: Record<string, string> = {
-      'enero': '01', 'febrero': '02', 'marzo': '03', 'abril': '04',
-      'mayo': '05', 'junio': '06', 'julio': '07', 'agosto': '08',
-      'septiembre': '09', 'octubre': '10', 'noviembre': '11', 'diciembre': '12',
+      enero: '01',
+      febrero: '02',
+      marzo: '03',
+      abril: '04',
+      mayo: '05',
+      junio: '06',
+      julio: '07',
+      agosto: '08',
+      septiembre: '09',
+      octubre: '10',
+      noviembre: '11',
+      diciembre: '12',
     };
     periodMonth = monthNames[monthName] || '01';
     periodYear = periodMatch[2];
   }
 
-  const amountPattern = /^[\d,]+\.\d{2}$/;
-
   for (const pageItems of pages) {
     const rows = groupIntoRows(pageItems);
-    
+
     for (const row of rows) {
       const texts = row.map(item => item.str);
-      
-      // First element should be the day (1-2 digits)
       if (texts.length < 3) continue;
+
       const dayMatch = texts[0].match(/^(\d{1,2})$/);
       if (!dayMatch) continue;
-      
-      const day = dayMatch[1].padStart(2, '0');
-      const dateStr = `${day}/${periodMonth}/${periodYear}`;
-      
-      // Find amount columns by X position
-      // Amounts are at the right side of the row
-      const amountItems: { value: string; x: number; idx: number }[] = [];
-      for (let i = 1; i < texts.length; i++) {
-        if (amountPattern.test(texts[i])) {
-          amountItems.push({ value: texts[i], x: row[i].x, idx: i });
-        }
-      }
-      
-      if (amountItems.length === 0) continue;
-      
-      // Description is everything between day and first amount
-      const descParts: string[] = [];
-      for (let i = 1; i < amountItems[0].idx; i++) {
-        descParts.push(texts[i]);
-      }
-      const description = descParts.join(' ').trim();
+
+      const amountEntries = texts
+        .map((text, idx) => ({ text, idx, x: row[idx].x, value: parseAmountNumber(text) }))
+        .filter(entry => isAmountToken(entry.text) && entry.value !== null) as Array<{
+          text: string;
+          idx: number;
+          x: number;
+          value: number;
+        }>;
+
+      if (amountEntries.length === 0) continue;
+
+      const description = texts.slice(1, amountEntries[0].idx).join(' ').trim();
       if (description.length < 2) continue;
-      
-      // Determine if cargo or abono based on column position
-      // In Banregio format: CARGOS column is before ABONOS column
-      // If there are 3 amounts, they're typically: cargo, abono, saldo (some may be empty)
-      // If there are 2 amounts: either (cargo, saldo) or (abono, saldo)
-      // We need X position to determine column
-      
-      // Simple heuristic: if description contains "Abono" or "Pago" keywords, it's an abono
-      // Otherwise, use position-based logic
-      const descLower = description.toLowerCase();
-      
-      let amount: string;
-      let type: 'cargo' | 'abono';
-      
-      if (amountItems.length >= 3) {
-        // cargo, abono, saldo - pick the non-saldo ones
-        // The last amount is usually the saldo
-        const cargoVal = cleanAmount(amountItems[0].value);
-        const abonoVal = cleanAmount(amountItems[1].value);
-        
-        if (parseFloat(cargoVal) > 0 && amountItems[0].x < amountItems[1].x) {
-          // First is cargo column
-          amount = `-${cargoVal}`;
-          type = 'cargo';
-        } else {
-          amount = abonoVal;
-          type = 'abono';
-        }
-      } else if (amountItems.length === 2) {
-        // One amount + saldo
-        const val = cleanAmount(amountItems[0].value);
-        
-        // Use X position: cargo column is more to the left than abono
-        // Also check keywords
-        const isAbono = descLower.includes('abono') || 
-                        descLower.includes('pago cap') || 
-                        descLower.includes('pago intereses') ||
-                        descLower.includes('spei recibido') ||
-                        descLower.includes('abono por devolucion');
-        
-        // Check if the amount's X position suggests it's in the ABONOS column
-        // Typically CARGOS column X < ABONOS column X
-        // We'll rely on keywords + X position relative to the saldo column
-        if (isAbono) {
-          amount = val;
-          type = 'abono';
-        } else {
-          amount = `-${val}`;
-          type = 'cargo';
-        }
-      } else {
-        // Single amount - determine by keywords
-        const val = cleanAmount(amountItems[0].value);
-        const isAbono = descLower.includes('abono') || descLower.includes('pago cap') || descLower.includes('pago intereses');
-        amount = isAbono ? val : `-${val}`;
-        type = isAbono ? 'abono' : 'cargo';
-      }
-      
-      results.push({ date: dateStr, description, amount, type });
+
+      const amountValue = cleanAmount(amountEntries[0].text);
+      const normalized = normalizeText(description);
+      const isAbono = /(abono|spei recibido|pago cap|pago intereses|devolucion)/.test(normalized);
+
+      results.push({
+        date: `${dayMatch[1].padStart(2, '0')}/${periodMonth}/${periodYear}`,
+        description,
+        amount: isAbono ? amountValue : `-${amountValue}`,
+        type: isAbono ? 'abono' : 'cargo',
+      });
     }
   }
 
   return results;
 }
 
-/**
- * Fallback parser using simple regex (original approach)
- */
 function parseFallback(fullText: string): ParsedRow[] {
-  const lines = fullText.split('\n').filter(l => l.trim());
+  const lines = fullText.split('\n').filter(line => line.trim());
   const results: ParsedRow[] = [];
-
   const datePattern = /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/;
   const amountPattern = /(-?\$?[\d,]+\.\d{2})/g;
 
@@ -456,51 +468,37 @@ function parseFallback(fullText: string): ParsedRow[] {
     const dateEnd = line.indexOf(dateMatch[1]) + dateMatch[1].length;
     const amountStart = line.indexOf(amount);
     const description = line.substring(dateEnd, amountStart).trim();
+    if (description.length <= 2) continue;
 
-    if (description.length > 2) {
-      const cleanAmt = amount.replace(/[$,]/g, '');
-      results.push({
-        date: dateMatch[1],
-        description,
-        amount: cleanAmt,
-        type: parseFloat(cleanAmt) >= 0 ? 'abono' : 'cargo',
-      });
-    }
+    const cleanAmt = amount.replace(/[$,]/g, '');
+    results.push({
+      date: dateMatch[1],
+      description,
+      amount: cleanAmt,
+      type: parseFloat(cleanAmt) >= 0 ? 'abono' : 'cargo',
+    });
   }
 
   return results;
 }
 
-/**
- * Main entry: extract text from PDF file
- */
 export async function extractTextFromPdf(file: File): Promise<string> {
   const { fullText } = await extractTextItems(file);
   return fullText;
 }
 
-/**
- * Main entry: parse PDF and return structured transactions
- */
-export async function parsePdfFile(file: File): Promise<Array<{
-  date: string;
-  description: string;
-  amount: string;
-}>> {
+export async function parsePdfFile(file: File): Promise<Array<{ date: string; description: string; amount: string }>> {
   const { pages, fullText } = await extractTextItems(file);
   const format = detectFormat(fullText);
-  
-  console.log(`[PDF Parser] Detected format: ${format}`);
-  console.log(`[PDF Parser] Total pages: ${pages.length}`);
-  
+
   let parsed: ParsedRow[] = [];
-  
+
   switch (format) {
     case 'bbva_debit':
       parsed = parseBBVADebit(pages, fullText);
       break;
     case 'bbva_credit':
-      parsed = parseBBVACredit(pages, fullText);
+      parsed = parseBBVACredit(pages);
       break;
     case 'banregio':
       parsed = parseBanregio(pages, fullText);
@@ -510,9 +508,7 @@ export async function parsePdfFile(file: File): Promise<Array<{
       break;
   }
 
-  // If specific parser found nothing, try fallback
   if (parsed.length === 0 && format !== 'unknown') {
-    console.log('[PDF Parser] Specific parser found nothing, trying fallback');
     parsed = parseFallback(fullText);
   }
 
@@ -523,14 +519,7 @@ export async function parsePdfFile(file: File): Promise<Array<{
   }));
 }
 
-/**
- * Legacy function kept for backward compat
- */
-export function parsePdfTransactionLines(text: string): Array<{
-  date: string;
-  description: string;
-  amount: string;
-}> {
+export function parsePdfTransactionLines(text: string): Array<{ date: string; description: string; amount: string }> {
   return parseFallback(text).map(row => ({
     date: row.date,
     description: row.description,
